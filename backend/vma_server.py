@@ -92,6 +92,12 @@ class VMAStateManager:
         return {"all_pids": {str(p): vmas for p, vmas in self._state.items()},
                 "ts": time.time_ns()}
 
+    def reset(self, pid: int = None):
+        if pid is not None:
+            self._state.pop(pid, None)
+        else:
+            self._state.clear()
+
 state_mgr = VMAStateManager()
 
 # ── /proc/<pid>/maps reader ────────────────────────────────────────
@@ -161,33 +167,43 @@ hub = WSHub()
 tracked_pids: set[int] = set()
 
 # ── Kernel collector ───────────────────────────────────────────────
+# kfifo debugfs files do NOT support persistent fd polling.
+# Each open() drains whatever is currently in the kfifo ring buffer,
+# then the fd is exhausted. We must open/read/close on every poll cycle.
 async def kernel_collector():
     log.info("Collector waiting for %s …", DEBUGFS_PATH)
     buf = ""
+    logged_ready = False
     while True:
         if not os.path.exists(DEBUGFS_PATH):
-            await asyncio.sleep(1); continue
+            await asyncio.sleep(1)
+            continue
         try:
+            # open → read all available bytes → close  (one shot per cycle)
             fd = os.open(DEBUGFS_PATH, os.O_RDONLY | os.O_NONBLOCK)
-            log.info("Opened debugfs, streaming events…")
             try:
-                while True:
-                    try:
-                        chunk = os.read(fd, READ_CHUNK)
-                        if chunk:
-                            buf += chunk.decode("utf-8", errors="replace")
-                            while "\n" in buf:
-                                line, buf = buf.split("\n", 1)
-                                ev = parse_line(line)
-                                if ev: await handle_event(ev)
-                        else:
-                            await asyncio.sleep(POLL_INTERVAL)
-                    except BlockingIOError:
-                        await asyncio.sleep(POLL_INTERVAL)
+                chunk = os.read(fd, READ_CHUNK)
+            except BlockingIOError:
+                chunk = b""   # kfifo empty — nothing to read this cycle
             finally:
                 os.close(fd)
+
+            if chunk:
+                if not logged_ready:
+                    log.info("Receiving events from debugfs…")
+                    logged_ready = True
+                buf += chunk.decode("utf-8", errors="replace")
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    ev = parse_line(line)
+                    if ev:
+                        await handle_event(ev)
+            else:
+                # Nothing in kfifo — yield control then poll again
+                await asyncio.sleep(POLL_INTERVAL)
+
         except OSError as e:
-            log.warning("OSError: %s — retry in 1s", e)
+            log.warning("OSError reading debugfs: %s — retry in 1s", e)
             await asyncio.sleep(1)
 
 async def handle_event(ev):
@@ -224,6 +240,20 @@ async def handle_event(ev):
     })
 
 # ── Endpoints ──────────────────────────────────────────────────────
+@app.post("/reset")
+async def do_reset(pid: int = None):
+    """Clear backend state and broadcast reset to all clients."""
+    if pid is not None:
+        state_mgr.reset(pid)
+        tracked_pids.discard(pid)
+        log.info("Reset PID %d", pid)
+    else:
+        state_mgr.reset()
+        tracked_pids.clear()
+        log.info("Reset all")
+    await hub.broadcast({"type": "reset", "pid": pid})
+    return {"ok": True, "pid": pid}
+
 @app.get("/snapshot")
 async def get_snapshot(pid: int = None):
     return JSONResponse(state_mgr.vmas_only(pid) if pid else state_mgr.full_snapshot())

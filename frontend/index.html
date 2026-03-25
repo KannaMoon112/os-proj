@@ -142,7 +142,7 @@ button:hover{background:var(--border)}
   <div class="right">
     <label style="font-family:var(--mono);font-size:11px;color:var(--dim)">PID</label>
     <select id="pidsel"><option value="">— all —</option></select>
-    <button id="btnclr">clear</button>
+    <button id="btnclr" title="Clear backend state + frontend — use between runs">⟳ reset run</button>
   </div>
 </header>
 
@@ -374,6 +374,13 @@ function dispatch(msg) {
   const { type, payload } = msg;
   if (type === 'pong') return;
 
+  if (type === 'reset') {
+    // Server-side state was cleared — wipe frontend too
+    clearFrontend();
+    addEvent({ event: 'BASELINE', pid: '—', count: 0, _label: '— reset —' });
+    return;
+  }
+
   if (type === 'init') {
     for (const [pidStr, vmas] of Object.entries(payload.all_pids || {})) {
       snapshots[pidStr] = { pid: parseInt(pidStr), vmas: vmas || [] };
@@ -382,7 +389,6 @@ function dispatch(msg) {
   }
 
   if (type === 'baseline') {
-    // payload = { pid, vmas, ts }
     snapshots[String(payload.pid)] = payload;
     syncPids(); renderVAS();
     addEvent({ event:'BASELINE', pid:payload.pid, count:(payload.vmas||[]).length });
@@ -390,11 +396,10 @@ function dispatch(msg) {
   }
 
   if (type === 'vma_event') {
-    // msg.snapshot = { pid, vmas, ts }
     const snap = msg.snapshot;
     if (snap && snap.pid != null) {
       snapshots[String(snap.pid)] = snap;
-      syncPids(); renderVAS();  // ← re-render immediately
+      syncPids(); renderVAS();
     }
     if (payload && payload.event) { addEvent(payload); eventCount++; updateStats(); }
     return;
@@ -411,13 +416,30 @@ function syncPids() {
   if (prev && pids.includes(prev)) sel.value = prev;
 }
 document.getElementById('pidsel').addEventListener('change', e => { currentPid = e.target.value || null; renderVAS(); });
-document.getElementById('btnclr').addEventListener('click', () => {
-  snapshots={}; eventCount=0;
-  document.getElementById('event-list').innerHTML='';
-  // Clear DOM segments
-  Object.values(segEls).forEach(({row})=>row.remove());
-  Object.keys(segEls).forEach(k=>delete segEls[k]);
+// Shared clear helper (used by button AND reset message)
+function clearFrontend() {
+  snapshots = {}; eventCount = 0;
+  document.getElementById('event-list').innerHTML = '';
+  Object.values(segEls).forEach(({row}) => row.remove());
+  Object.keys(segEls).forEach(k => delete segEls[k]);
   syncPids(); renderVAS(); updateStats();
+}
+
+document.getElementById('btnclr').addEventListener('click', async () => {
+  // Disable briefly to prevent double-click
+  const btn = document.getElementById('btnclr');
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    await fetch('/reset', { method: 'POST' });
+    // clearFrontend() will be called when the server broadcasts { type:"reset" }
+  } catch(e) {
+    // Fallback: clear frontend only if server unreachable
+    clearFrontend();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⟳ reset run';
+  }
 });
 
 function getVmas() {
