@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""
+vma_server.py — FastAPI + WebSocket backend for VMA visualizer
+
+Architecture:
+  ┌─────────────────┐     kfifo/debugfs     ┌──────────────────┐
+  │  vma_tracker.ko │ ──────────────────►   │  KernelCollector │
+  └─────────────────┘                       │  (async reader)  │
+                                            └────────┬─────────┘
+                                                     │ parse + classify
+                                            ┌────────▼─────────┐
+                                            │  VMAStateManager │  <- ground truth
+                                            │  (interval tree) │
+                                            └────────┬─────────┘
+                                                     │ broadcast
+                                            ┌────────▼─────────┐
+                                            │  WebSocket hub   │
+                                            └────────┬─────────┘
+                                                     │
+                                            ┌────────▼─────────┐
+                                            │    Browser       │
+                                            └──────────────────┘
+"""
+
+import asyncio
+import json
+import os
+import re
+import time
+import logging
+from collections import defaultdict
+from typing import Optional
+
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
+
+# ─── Configuration ───────────────────────────────────────────────
+DEBUGFS_PATH = "/sys/kernel/debug/vma_tracker/data"
+READ_CHUNK   = 4096
+POLL_INTERVAL = 0.005   # 5 ms — tight loop for real-time feel
+
+app = FastAPI(title="VMA Visualizer")
+
+# ─── VMA Data Model ──────────────────────────────────────────────
+def make_vma(start, end, perms, path, vma_type, pid, ts, source_op):
+    return {
+        "start":  start,
+        "end":    end,
+        "len":    end - start,
+        "perms":  perms,
+        "path":   path,
+        "type":   vma_type,
+        "pid":    pid,
+        "ts":     ts,
+        "source": source_op,
+    }
+
+# ─── VMA State Manager ───────────────────────────────────────────
+class VMAStateManager:
+    """
+    Maintains current VMA list per PID.
+    Supports: add, remove (full & partial), brk resize, snapshot.
+    """
+
+    def __init__(self):
+        # pid -> list of vma dicts, sorted by start
+        self._state: dict[int, list] = defaultdict(list)
+        self._events: list = []          # ordered event log (capped)
+        self._max_events = 500
+
+    def _sorted_insert(self, pid: int, vma: dict):
+        lst = self._state[pid]
+        # insert keeping sorted order by start addr
+        i = 0
+        while i < len(lst) and lst[i]["start"] < vma["start"]:
+            i += 1
+        lst.insert(i, vma)
+
+    def _log_event(self, event: dict):
+        self._events.append(event)
+        if len(self._events) > self._max_events:
+            self._events = self._events[-self._max_events:]
+
+    def apply_mmap(self, pid, start, end, perms, path, vtype, ts):
+        """Add a new VMA (MMAP event)."""
+        vma = make_vma(start, end, perms, path, vtype, pid, ts, "MMAP")
+        self._sorted_insert(pid, vma)
+        event = {"event": "MMAP", **vma}
+        self._log_event(event)
+        return event
+
+    def apply_brk(self, pid, start, end, ts):
+        """Update or create the heap VMA (BRK event)."""
+        lst = self._state[pid]
+        # Find existing heap entry
+        for i, v in enumerate(lst):
+            if v["type"] == "heap":
+                old_end = v["end"]
+                lst[i] = make_vma(start, end, "rw-", "[heap]",
+                                  "heap", pid, ts, "BRK")
+                direction = "grow" if end > old_end else "shrink"
+                event = {"event": "BRK", "direction": direction, **lst[i]}
+                self._log_event(event)
+                return event
+        # No heap yet — create one
+        vma = make_vma(start, end, "rw-", "[heap]", "heap", pid, ts, "BRK")
+        self._sorted_insert(pid, vma)
+        event = {"event": "BRK", "direction": "init", **vma}
+        self._log_event(event)
+        return event
+
+    def apply_munmap(self, pid, start, end, ts):
+        """
+        Remove or clip VMAs that overlap [start, end).
+        munmap may be partial — split surviving portions.
+        """
+        lst = self._state[pid]
+        new_lst = []
+        removed = []
+        for v in lst:
+            vs, ve = v["start"], v["end"]
+            # No overlap
+            if ve <= start or vs >= end:
+                new_lst.append(v)
+                continue
+            removed.append(v)
+            # Left remnant
+            if vs < start:
+                left = make_vma(vs, start, v["perms"], v["path"],
+                                v["type"], pid, ts, "MUNMAP_CLIP")
+                new_lst.append(left)
+            # Right remnant
+            if ve > end:
+                right = make_vma(end, ve, v["perms"], v["path"],
+                                 v["type"], pid, ts, "MUNMAP_CLIP")
+                new_lst.append(right)
+
+        self._state[pid] = sorted(new_lst, key=lambda x: x["start"])
+        event = {"event": "MUNMAP",
+                 "pid": pid, "ts": ts,
+                 "start": start, "end": end,
+                 "removed": removed}
+        self._log_event(event)
+        return event
+
+    def apply_fork(self, parent_pid, child_pid, ts):
+        """Clone parent VMA list to child."""
+        parent_vmas = self._state.get(parent_pid, [])
+        child_vmas  = [dict(v, pid=child_pid, source="FORK")
+                       for v in parent_vmas]
+        self._state[child_pid] = child_vmas
+        event = {"event": "FORK",
+                 "parent_pid": parent_pid,
+                 "child_pid": child_pid,
+                 "ts": ts,
+                 "cloned": len(child_vmas)}
+        self._log_event(event)
+        return event
+
+    def apply_baseline(self, pid: int, maps_vmas: list):
+        """Seed state from /proc/<pid>/maps snapshot."""
+        self._state[pid] = sorted(maps_vmas, key=lambda x: x["start"])
+        event = {"event": "BASELINE", "pid": pid,
+                 "count": len(maps_vmas), "ts": time.time_ns()}
+        self._log_event(event)
+        return event
+
+    def snapshot(self, pid: int = None) -> dict:
+        if pid is not None:
+            return {
+                "pid": pid,
+                "vmas": self._state.get(pid, []),
+                "events": self._events,
+                "ts": time.time_ns(),
+            }
+        return {
+            "all_pids": {str(p): vmas
+                         for p, vmas in self._state.items()},
+            "events": self._events,
+            "ts": time.time_ns(),
+        }
+
+state_mgr = VMAStateManager()
+
+# ─── /proc/<pid>/maps baseline reader ────────────────────────────
+def _guess_type_from_maps(start, end, perms, offset, dev, inode, path):
+    """Classify a maps entry into our type taxonomy."""
+    if not path:
+        return "anon"
+    if path == "[heap]":
+        return "heap"
+    if path == "[stack]":
+        return "stack"
+    if path.startswith("["):
+        return "special"
+    if ".so" in path:
+        return "shlib_text" if "x" in perms else "shlib_data"
+    # Main executable
+    if "x" in perms:
+        return "text"
+    if "w" in perms:
+        return "data"
+    return "rodata"
+
+def read_proc_maps(pid: int) -> list:
+    path = f"/proc/{pid}/maps"
+    vmas = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                # Format: addr_range perms offset dev inode [path]
+                parts = line.split(None, 5)
+                if len(parts) < 5:
+                    continue
+                addr_range, perms, offset, dev, inode = parts[:5]
+                map_path = parts[5].strip() if len(parts) == 6 else ""
+                start_s, end_s = addr_range.split("-")
+                start = int(start_s, 16)
+                end   = int(end_s,   16)
+                vtype = _guess_type_from_maps(
+                    start, end, perms, offset, dev, inode, map_path)
+                vma = make_vma(start, end, perms[:3], map_path, vtype,
+                               pid, time.time_ns(), "BASELINE")
+                vmas.append(vma)
+    except (FileNotFoundError, PermissionError) as e:
+        log.warning("Could not read %s: %s", path, e)
+    return vmas
+
+# ─── Kernel event parser ──────────────────────────────────────────
+# Format: ts_ns|pid|comm|op|0xstart|0xend|perms|path|type
+
+_LINE_RE = re.compile(
+    r"^(\d+)\|(\d+)\|(\S+)\|(\w+)\|"
+    r"(0x[0-9a-f]+)\|(0x[0-9a-f]+)\|"
+    r"(\S+)\|(\S+)\|(\S+)$"
+)
+
+def parse_kernel_line(line: str) -> Optional[dict]:
+    line = line.strip()
+    if not line:
+        return None
+    m = _LINE_RE.match(line)
+    if not m:
+        log.debug("Unmatched line: %r", line)
+        return None
+    ts, pid, comm, op, start, end, perms, path, vtype = m.groups()
+    return {
+        "ts":    int(ts),
+        "pid":   int(pid),
+        "comm":  comm,
+        "op":    op,
+        "start": int(start, 16),
+        "end":   int(end,   16),
+        "perms": perms,
+        "path":  path,
+        "type":  vtype,
+    }
+
+# ─── WebSocket connection manager ────────────────────────────────
+class WSHub:
+    def __init__(self):
+        self._connections: set[WebSocket] = set()
+        self._lock = asyncio.Lock()
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        async with self._lock:
+            self._connections.add(ws)
+
+    async def disconnect(self, ws: WebSocket):
+        async with self._lock:
+            self._connections.discard(ws)
+
+    async def broadcast(self, msg: dict):
+        data = json.dumps(msg, default=str)
+        dead = set()
+        for ws in list(self._connections):
+            try:
+                await ws.send_text(data)
+            except Exception:
+                dead.add(ws)
+        async with self._lock:
+            self._connections -= dead
+
+hub = WSHub()
+tracked_pids: set[int] = set()
+
+# ─── Kernel collector coroutine ───────────────────────────────────
+async def kernel_collector():
+    log.info("Kernel collector started. Waiting for %s …", DEBUGFS_PATH)
+    buf = ""
+    while True:
+        if not os.path.exists(DEBUGFS_PATH):
+            await asyncio.sleep(1)
+            continue
+        try:
+            with open(DEBUGFS_PATH, "rb") as f:
+                while True:
+                    chunk = f.read(READ_CHUNK)
+                    if not chunk:
+                        await asyncio.sleep(POLL_INTERVAL)
+                        continue
+                    buf += chunk.decode("utf-8", errors="replace")
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
+                        ev = parse_kernel_line(line)
+                        if ev is None:
+                            continue
+                        await process_kernel_event(ev)
+        except OSError as e:
+            log.warning("Read error: %s — retrying in 1 s", e)
+            await asyncio.sleep(1)
+
+async def process_kernel_event(ev: dict):
+    pid = ev["pid"]
+    ts  = ev["ts"]
+    op  = ev["op"]
+
+    # First time we see this PID — seed from /proc/<pid>/maps
+    if pid not in tracked_pids:
+        tracked_pids.add(pid)
+        baseline = read_proc_maps(pid)
+        if baseline:
+            b_ev = state_mgr.apply_baseline(pid, baseline)
+            await hub.broadcast({"type": "baseline",
+                                  "payload": state_mgr.snapshot(pid)})
+            log.info("Baseline PID %d: %d VMAs", pid, len(baseline))
+
+    if op == "MMAP":
+        out = state_mgr.apply_mmap(
+            pid, ev["start"], ev["end"],
+            ev["perms"], ev["path"], ev["type"], ts)
+        await hub.broadcast({"type": "vma_event", "payload": out,
+                              "snapshot": state_mgr.snapshot(pid)})
+
+    elif op == "BRK":
+        out = state_mgr.apply_brk(pid, ev["start"], ev["end"], ts)
+        await hub.broadcast({"type": "vma_event", "payload": out,
+                              "snapshot": state_mgr.snapshot(pid)})
+
+    elif op == "MUNMAP":
+        out = state_mgr.apply_munmap(pid, ev["start"], ev["end"], ts)
+        await hub.broadcast({"type": "vma_event", "payload": out,
+                              "snapshot": state_mgr.snapshot(pid)})
+
+    elif op == "FORK":
+        child_pid = ev["start"]   # child PID encoded in start field
+        out = state_mgr.apply_fork(pid, child_pid, ts)
+        await hub.broadcast({"type": "vma_event", "payload": out,
+                              "snapshot": state_mgr.snapshot(pid)})
+
+# ─── HTTP / WS endpoints ─────────────────────────────────────────
+@app.get("/snapshot")
+async def get_snapshot(pid: int = None):
+    return JSONResponse(state_mgr.snapshot(pid))
+
+@app.get("/pids")
+async def get_pids():
+    return {"pids": sorted(tracked_pids)}
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await hub.connect(ws)
+    # Send current snapshot immediately on connect
+    snap = state_mgr.snapshot()
+    await ws.send_text(json.dumps({"type": "init", "payload": snap},
+                                   default=str))
+    try:
+        while True:
+            # Keep alive: echo pings
+            data = await asyncio.wait_for(ws.receive_text(), timeout=30)
+            if data == "ping":
+                await ws.send_text(json.dumps({"type": "pong"}))
+    except (WebSocketDisconnect, asyncio.TimeoutError):
+        pass
+    finally:
+        await hub.disconnect(ws)
+
+# Serve the frontend
+@app.get("/")
+async def serve_ui():
+    html_path = os.path.join(os.path.dirname(__file__), "..", "frontend", "index.html")
+    with open(html_path) as f:
+        return HTMLResponse(f.read())
+
+# ─── Startup ─────────────────────────────────────────────────────
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(kernel_collector())
+
+if __name__ == "__main__":
+    uvicorn.run("vma_server:app", host="0.0.0.0", port=8000,
+                reload=False, log_level="info")
