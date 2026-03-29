@@ -1,3 +1,4 @@
+/* /Users/kannatsuki/Desktop/os-proj/vma_tracker.c */
 // vma_tracker.c — LKM-based VMA event tracer
 // Hooks: mmap (kretprobe), munmap (kprobe), brk (kretprobe), fork (kretprobe)
 // Output: /sys/kernel/debug/vma_tracker/data (via kfifo)
@@ -25,10 +26,23 @@ MODULE_AUTHOR("CSC5031 Project");
 MODULE_DESCRIPTION("VMA Lifecycle Tracker via kprobes");
 
 /* ─── Configuration ─────────────────────────────────────────── */
-/* Target process name filter — change via module param */
-static char target_comm[TASK_COMM_LEN] = "malloc_test";
+/*
+ * target_comm:
+ *   "*"   -> track all processes
+ *   "xxx" -> track only current->comm == xxx
+ */
+static char target_comm[TASK_COMM_LEN] = "*";
+// static char target_comm[TASK_COMM_LEN] = "malloc_test";
+
 module_param_string(target_comm, target_comm, TASK_COMM_LEN, 0644);
-MODULE_PARM_DESC(target_comm, "Process name to monitor (default: malloc_test)");
+MODULE_PARM_DESC(target_comm, "Process name to monitor ('*' = all, default)");
+
+static inline bool should_track_current(void)
+{
+    if (target_comm[0] == '*' && target_comm[1] == '\0')
+        return true;
+    return strncmp(current->comm, target_comm, TASK_COMM_LEN) == 0;
+}
 
 /* ─── kfifo ring buffer ──────────────────────────────────────── */
 #define FIFO_SIZE (1 << 17)   /* 128 KB ring buffer */
@@ -45,40 +59,23 @@ static void perms_str(unsigned long flags, char *buf)
     buf[3] = '\0';
 }
 
-/*
- * Classify a VMA into a human-readable type string.
- * The frontend uses these labels for colour assignment.
- */
 static const char *classify_vma(struct vm_area_struct *vma,
-                                 unsigned long brk_start,
-                                 unsigned long brk_end)
+                                unsigned long brk_start,
+                                unsigned long brk_end)
 {
     if (!vma) return "unknown";
+    if (vma->vm_flags & VM_GROWSDOWN) return "stack";
+    if (vma->vm_start >= brk_start && vma->vm_end <= brk_end + PAGE_SIZE) return "heap";
 
-    /* Stack: grows downward flag or [stack] path */
-    if (vma->vm_flags & VM_GROWSDOWN)
-        return "stack";
-
-    /* Heap: falls within brk region */
-    if (vma->vm_start >= brk_start && vma->vm_end <= brk_end + PAGE_SIZE)
-        return "heap";
-
-    /* File-backed */
     if (vma->vm_file) {
         const char *name = vma->vm_file->f_path.dentry->d_name.name;
-        /* Shared library (.so) */
         if (strstr(name, ".so"))
             return (vma->vm_flags & VM_EXEC) ? "shlib_text" : "shlib_data";
-        /* Main executable text vs data */
-        if (vma->vm_flags & VM_EXEC)
-            return "text";
+        if (vma->vm_flags & VM_EXEC) return "text";
         return "data";
     }
 
-    /* Anonymous mmap */
-    if (vma->vm_flags & VM_EXEC)
-        return "anon_exec";
-
+    if (vma->vm_flags & VM_EXEC) return "anon_exec";
     return "anon";
 }
 
@@ -88,8 +85,8 @@ static void push_event(const char *op,
                        const char *type)
 {
     char buf[320];
-    int  len;
-    u64  ts = ktime_get_ns();
+    int len;
+    u64 ts = ktime_get_ns();
 
     len = snprintf(buf, sizeof(buf),
                    "%llu|%d|%s|%s|0x%lx|0x%lx|%s|%s|%s\n",
@@ -113,33 +110,30 @@ static int mmap_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
     const char *path = "anon";
     const char *type;
 
-    if (strcmp(current->comm, target_comm) != 0) return 0;
-    if (!current->mm || addr >= TASK_SIZE)         return 0;
+    if (!should_track_current()) return 0;
+    if (!current->mm || addr >= TASK_SIZE) return 0;
 
     vma = find_vma(current->mm, addr);
     if (!vma) return 0;
 
     perms_str(vma->vm_flags, perms);
-    if (vma->vm_file)
-        path = vma->vm_file->f_path.dentry->d_name.name;
+    if (vma->vm_file) path = vma->vm_file->f_path.dentry->d_name.name;
 
-    type = classify_vma(vma,
-                        current->mm->start_brk,
-                        current->mm->brk);
+    type = classify_vma(vma, current->mm->start_brk, current->mm->brk);
     push_event("MMAP", vma->vm_start, vma->vm_end, perms, path, type);
     return 0;
 }
 
 static struct kretprobe rp_mmap = {
-    .handler       = mmap_ret,
+    .handler = mmap_ret,
     .kp.symbol_name = "vm_mmap_pgoff",
-    .maxactive     = 20,
+    .maxactive = 20,
 };
 
 /* ─── kretprobe: brk ─────────────────────────────────────────── */
 static int brk_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    if (strcmp(current->comm, target_comm) != 0) return 0;
+    if (!should_track_current()) return 0;
     if (!current->mm) return 0;
 
     push_event("BRK",
@@ -150,12 +144,12 @@ static int brk_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 }
 
 static struct kretprobe rp_brk = {
-    .handler       = brk_ret,
+    .handler = brk_ret,
     .kp.symbol_name = "__x64_sys_brk",
-    .maxactive     = 20,
+    .maxactive = 20,
 };
 
-/* ─── kprobe: munmap (pre — capture args BEFORE VMA is gone) ─── */
+/* ─── kprobe: munmap ─────────────────────────────────────────── */
 static int munmap_pre(struct kprobe *p, struct pt_regs *regs)
 {
     unsigned long addr, len;
@@ -164,22 +158,18 @@ static int munmap_pre(struct kprobe *p, struct pt_regs *regs)
     const char *path = "none";
     const char *type = "anon";
 
-    if (strcmp(current->comm, target_comm) != 0) return 0;
+    if (!should_track_current()) return 0;
     if (!current->mm) return 0;
 
     addr = regs->di;
-    len  = regs->si;
+    len = regs->si;
     if (!len) return 0;
 
-    /* Try to resolve VMA metadata before it is destroyed */
     vma = find_vma(current->mm, addr);
     if (vma && vma->vm_start <= addr) {
         perms_str(vma->vm_flags, perms);
-        if (vma->vm_file)
-            path = vma->vm_file->f_path.dentry->d_name.name;
-        type = classify_vma(vma,
-                            current->mm->start_brk,
-                            current->mm->brk);
+        if (vma->vm_file) path = vma->vm_file->f_path.dentry->d_name.name;
+        type = classify_vma(vma, current->mm->start_brk, current->mm->brk);
     }
 
     push_event("MUNMAP", addr, addr + len, perms, path, type);
@@ -191,35 +181,31 @@ static struct kprobe kp_munmap = {
     .symbol_name = "__x64_sys_munmap",
 };
 
-/* ─── kretprobe: fork (Option A) ─────────────────────────────── */
+/* ─── kretprobe: fork ────────────────────────────────────────── */
 static int fork_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     long child_pid = regs_return_value(regs);
 
-    if (strcmp(current->comm, target_comm) != 0) return 0;
-    if (child_pid <= 0) return 0;   /* in child, return is 0 */
+    if (!should_track_current()) return 0;
+    if (child_pid <= 0) return 0;
 
-    /* Encode child PID in the start field; front-end uses this */
-    push_event("FORK",
-               (unsigned long)child_pid, 0,
-               "---", "child_born", "fork");
+    push_event("FORK", (unsigned long)child_pid, 0, "---", "child_born", "fork");
     return 0;
 }
 
 static struct kretprobe rp_fork = {
-    .handler       = fork_ret,
+    .handler = fork_ret,
     .kp.symbol_name = "kernel_clone",
-    .maxactive     = 20,
+    .maxactive = 20,
 };
 
-/* ─── DebugFS read (blocking) ────────────────────────────────── */
+/* ─── DebugFS read ───────────────────────────────────────────── */
 static ssize_t vma_read(struct file *file, char __user *ubuf,
                         size_t count, loff_t *ppos)
 {
     unsigned int copied = 0;
     int ret;
 
-    /* Block until data is available (or non-blocking flag set) */
     if (kfifo_is_empty(&vma_fifo)) {
         if (file->f_flags & O_NONBLOCK)
             return -EAGAIN;
@@ -234,8 +220,7 @@ static ssize_t vma_read(struct file *file, char __user *ubuf,
     return ret ? -EFAULT : copied;
 }
 
-static unsigned int vma_poll(struct file *file,
-                              struct poll_table_struct *wait)
+static unsigned int vma_poll(struct file *file, struct poll_table_struct *wait)
 {
     poll_wait(file, &fifo_wq, wait);
     if (!kfifo_is_empty(&vma_fifo))
@@ -245,8 +230,8 @@ static unsigned int vma_poll(struct file *file,
 
 static const struct file_operations vma_fops = {
     .owner = THIS_MODULE,
-    .read  = vma_read,
-    .poll  = vma_poll,
+    .read = vma_read,
+    .poll = vma_poll,
 };
 
 /* ─── Module lifecycle ───────────────────────────────────────── */
@@ -259,20 +244,23 @@ static int __init tracker_init(void)
     INIT_KFIFO(vma_fifo);
     init_waitqueue_head(&fifo_wq);
 
-    if ((err = register_kretprobe(&rp_mmap)))   goto fail_mmap;
-    if ((err = register_kretprobe(&rp_brk)))    goto fail_brk;
-    if ((err = register_kprobe(&kp_munmap)))    goto fail_munmap;
-    if ((err = register_kretprobe(&rp_fork)))   goto fail_fork;
+    if ((err = register_kretprobe(&rp_mmap))) goto fail_mmap;
+    if ((err = register_kretprobe(&rp_brk))) goto fail_brk;
+    if ((err = register_kprobe(&kp_munmap))) goto fail_munmap;
+    if ((err = register_kretprobe(&rp_fork))) goto fail_fork;
 
-    dbg_dir  = debugfs_create_dir("vma_tracker", NULL);
+    dbg_dir = debugfs_create_dir("vma_tracker", NULL);
     dbg_file = debugfs_create_file("data", 0444, dbg_dir, NULL, &vma_fops);
 
-    pr_info("vma_tracker: loaded, watching comm='%s'\n", target_comm);
+    pr_info("vma_tracker: loaded, target_comm='%s'\n", target_comm);
     return 0;
 
-fail_fork:   unregister_kprobe(&kp_munmap);
-fail_munmap: unregister_kretprobe(&rp_brk);
-fail_brk:    unregister_kretprobe(&rp_mmap);
+fail_fork:
+    unregister_kprobe(&kp_munmap);
+fail_munmap:
+    unregister_kretprobe(&rp_brk);
+fail_brk:
+    unregister_kretprobe(&rp_mmap);
 fail_mmap:
     return err;
 }

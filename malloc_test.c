@@ -23,12 +23,29 @@
 #include <time.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
-#define SMALL   (32  * 1024)        /* 32 KB  -> brk */
-#define LARGE   (256 * 1024)        /* 256 KB -> mmap */
-#define DELAY_US 600000             /* 0.6 s between ops */
+#define SMALL      (32  * 1024)
+#define LARGE      (256 * 1024)
+#define DELAY_US   600000
+
+/* leak visualization tuned params */
+#define LEAK_CHUNK (512 * 1024)   /* 512KB each alloc */
+#define LEAK_ROUND 24             /* total ~12MB leak */
 
 static void wait_us(int us) { usleep(us); }
+
+static void touch_all_pages(void *p, size_t sz) {
+    volatile unsigned char *x = (volatile unsigned char *)p;
+    for (size_t i = 0; i < sz; i += 4096) x[i] = 0xAB;
+}
+
+static void print_brk(const char *tag) {
+    void *brk_now = sbrk(0);
+    printf("%s brk=%p\n", tag, brk_now);
+}
 
 /* ── Scenario 1: heap grow/shrink ───────────────────────────── */
 static void scenario_heap(void) {
@@ -38,7 +55,7 @@ static void scenario_heap(void) {
     for (int i = 0; i < 8; i++) {
         p[i] = malloc(SMALL * (i + 1));
         printf("[heap] alloc %d KB at %p\n",
-               (int)((SMALL * (i+1)) / 1024), p[i]);
+               (int)((SMALL * (i + 1)) / 1024), p[i]);
         wait_us(DELAY_US);
     }
     printf("[heap] Peak allocated. Now freeing...\n");
@@ -49,16 +66,36 @@ static void scenario_heap(void) {
     }
 }
 
-/* ── Scenario 2: memory leak (heap only grows) ────────────── */
+/* ── Scenario 2: memory leak (strongly visible growth) ─────── */
 static void scenario_leak(void) {
     printf("\n[leak] Simulating memory leak (no free)\n");
-    for (int i = 0; i < 12; i++) {
-        void *p = malloc(SMALL);
-        memset(p, 0xAB, SMALL);   /* touch to force page allocation */
+
+#ifdef __GLIBC__
+    /*Watch:
+     * Force medium allocations to prefer heap/brk instead of mmap,
+     * and reduce heap trimming so growth is easier to observe.
+     */
+    mallopt(M_MMAP_THRESHOLD, 1024 * 1024 * 1024);
+    mallopt(M_TRIM_THRESHOLD, -1);
+#endif
+
+    void *leaks[LEAK_ROUND] = {0};
+    print_brk("[leak] before");
+
+    for (int i = 0; i < LEAK_ROUND; i++) {
+        leaks[i] = malloc(LEAK_CHUNK);
+        if (!leaks[i]) {
+            perror("[leak] malloc");
+            break;
+        }
+        touch_all_pages(leaks[i], LEAK_CHUNK);
         printf("[leak] alloc %d KB at %p (not freed)\n",
-               SMALL / 1024, p);
-        wait_us(DELAY_US);
+               LEAK_CHUNK / 1024, leaks[i]);
+        print_brk("[leak] step");
+        wait_us(350000); /* faster updates for UI */
     }
+
+    print_brk("[leak] after");
     printf("[leak] Process exiting — all leaked memory reclaimed by OS\n");
     wait_us(DELAY_US * 3);
 }
@@ -72,7 +109,7 @@ static void scenario_mmap(void) {
         size_t sz = LARGE * (1 << i);
         ptrs[i] = malloc(sz);
         printf("[mmap] alloc %.1f MB at %p (via mmap)\n",
-               (double)sz / (1024*1024), ptrs[i]);
+               (double)sz / (1024 * 1024), ptrs[i]);
         wait_us(DELAY_US);
     }
     for (int i = 0; i < 4; i++) {
@@ -101,22 +138,19 @@ static void scenario_anon_mmap(void) {
 static void scenario_fork(void) {
     printf("\n[fork] Fork demo\n");
 
-    /* Allocate some memory first */
     void *p = malloc(LARGE);
-    printf("[fork] parent allocated %d KB before fork\n", LARGE/1024);
+    printf("[fork] parent allocated %d KB before fork\n", LARGE / 1024);
     wait_us(DELAY_US);
 
     pid_t pid = fork();
     if (pid < 0) { perror("fork"); return; }
 
     if (pid == 0) {
-        /* child */
-        printf("[fork] child PID=%d — will allocate independently\n",
-               getpid());
+        printf("[fork] child PID=%d — will allocate independently\n", getpid());
         wait_us(DELAY_US);
         void *cp = malloc(SMALL * 3);
         printf("[fork] child allocated %d KB at %p (CoW diverge)\n",
-               (SMALL * 3)/1024, cp);
+               (SMALL * 3) / 1024, cp);
         wait_us(DELAY_US * 4);
         free(cp);
         free(p);
@@ -126,7 +160,7 @@ static void scenario_fork(void) {
         printf("[fork] parent PID=%d, child=%d\n", getpid(), pid);
         wait_us(DELAY_US * 2);
         void *pp = malloc(SMALL * 5);
-        printf("[fork] parent allocated extra %d KB\n", (SMALL*5)/1024);
+        printf("[fork] parent allocated extra %d KB\n", (SMALL * 5) / 1024);
         wait_us(DELAY_US * 4);
         free(pp);
         free(p);
@@ -135,7 +169,6 @@ static void scenario_fork(void) {
     }
 }
 
-/* ── main ───────────────────────────────────────────────────── */
 int main(int argc, char *argv[]) {
     srand((unsigned)time(NULL));
 
@@ -163,3 +196,4 @@ int main(int argc, char *argv[]) {
     printf("\n=== Demo complete ===\n");
     return 0;
 }
+   

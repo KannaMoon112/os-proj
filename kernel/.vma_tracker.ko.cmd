@@ -1,1 +1,0 @@
-cmd_/root/os-proj/kernel/vma_tracker.ko := ld -r -m elf_x86_64 -z noexecstack --build-id=sha1  -T scripts/module.lds -o /root/os-proj/kernel/vma_tracker.ko /root/os-proj/kernel/vma_tracker.o /root/os-proj/kernel/vma_tracker.mod.o;  true
